@@ -90,10 +90,10 @@ init_it(Starter, Parent, Name0, Mod, Args, Options) ->
     case catch Mod:init(Args) of
         {ok, State, Data} ->
             proc_lib:init_ack(Starter, {ok, self()}),
-            loop(Parent, Name, State, Data, Mod, infinity, Debug);
+            loop(Parent, Name, State, Data, Mod, infinity, Debug, []);
         {ok, State, Data, Timeout} ->
             proc_lib:init_ack(Starter, {ok, self()}),
-            loop(Parent, Name, State, Data, Mod, Timeout, Debug);
+            loop(Parent, Name, State, Data, Mod, Timeout, Debug, []);
         {stop, Reason} ->
             %% For consistency, we must make sure that the
             %% registered name (if any) is unregistered before
@@ -132,30 +132,32 @@ unregister_name({via, Mod, Name}) ->
 unregister_name(Pid) when is_pid(Pid) ->
     Pid.
 
-loop(Parent, Name, State, Data, Mod, hibernate, Debug) ->
-    proc_lib:hibernate(?MODULE,wake_hib,[Parent, Name, State, Data, Mod, Debug]);
-loop(Parent, Name, State, Data, Mod, Time, Debug) ->
+loop(Parent, Name, State, Data, Mod, hibernate, Debug, Next) ->
+    proc_lib:hibernate(?MODULE,wake_hib,[Parent, Name, State, Data, Mod, Debug, Next]);
+loop(Parent, Name, State, Data, Mod, Time, Debug, [Next|Enqueued]) ->
+    decode_msg(Next, Parent, Name, State, Data, Mod, Time, Debug, false, Enqueued);
+loop(Parent, Name, State, Data, Mod, Time, Debug, []) ->
     Msg = receive
               Input ->
                     Input
           after Time ->
                   timeout
           end,
-    decode_msg(Msg, Parent, Name, State, Data, Mod, Time, Debug, false).
+    decode_msg(Msg, Parent, Name, State, Data, Mod, Time, Debug, false, []).
 
-decode_msg(Msg, Parent, Name, State, Data, Mod, Time, Debug, Hib) ->
+decode_msg(Msg, Parent, Name, State, Data, Mod, Time, Debug, Hib, Next) ->
     case Msg of
         {system, From, Req} ->
             sys:handle_system_msg(Req, From, Parent, ?MODULE, Debug,
-                                  [Name, State, Data, Mod, Time], Hib);
+                                  [Name, State, Data, Mod, Time, Next], Hib);
         {'EXIT', Parent, Reason} ->
             terminate(Reason, Name, Msg, Mod, State, Data, Debug);
         _Msg when Debug =:= [] ->
-            handle_msg(Msg, Parent, Name, State, Data, Mod);
+            handle_msg(Msg, Parent, Name, State, Data, Mod, Next);
         _Msg ->
             Debug1 = sys:handle_debug(Debug, fun print_event/3,
                                       Name, {in, Msg}),
-            handle_msg(Msg, Parent, Name, State, Data, Mod, Debug1)
+            handle_msg(Msg, Parent, Name, State, Data, Mod, Debug1, Next)
     end.
 
 do_send(Dest, Msg) ->
@@ -235,83 +237,97 @@ try_terminate(Mod, Reason, State, Data) ->
 %%% Message handling functions
 %%% ---------------------------------------------------
 
-handle_msg({'$gen_call', From, Msg}, Parent, Name, State, Data, Mod) ->
+handle_msg({'$gen_call', From, Msg}, Parent, Name, State, Data, Mod, Next) ->
     Result = try_handle_call(Mod, Msg, From, State, Data),
     case Result of
         {ok, {reply, Reply, NState, NData}} ->
             reply(From, Reply),
-            loop(Parent, Name, NState, NData, Mod, infinity, []);
+            loop(Parent, Name, NState, NData, Mod, infinity, [], Next);
         {ok, {reply, Reply, NState, NData, Time1}} ->
             reply(From, Reply),
-            loop(Parent, Name, NState, NData, Mod, Time1, []);
+            loop(Parent, Name, NState, NData, Mod, Time1, [], Next);
+        {ok, {reply, Reply, NState, NData, Time1, {next, NextList}}} ->
+            reply(From, Reply),
+            loop(Parent, Name, NState, NData, Mod, Time1, [], Next ++ translate(NextList));
         {ok, {noreply, NState, NData}} ->
-            loop(Parent, Name, NState, NData, Mod, infinity, []);
+            loop(Parent, Name, NState, NData, Mod, infinity, [], Next);
         {ok, {noreply, NState, NData, Time1}} ->
-            loop(Parent, Name, NState, NData, Mod, Time1, []);
+            loop(Parent, Name, NState, NData, Mod, Time1, [], Next);
+        {ok, {noreply, NState, NData, Time1, {next, NextList}}} ->
+            loop(Parent, Name, NState, NData, Mod, Time1, [], Next ++ translate(NextList));
         {ok, {stop, Reason, Reply, NState, NData}} ->
             {'EXIT', R} = 
                 (catch terminate(Reason, Name, Msg, Mod, NState, NData, [])),
             reply(From, Reply),
             exit(R);
-        Other -> handle_common_reply(Other, Parent, Name, Msg, Mod, State, Data)
+        Other -> handle_common_reply(Other, Parent, Name, Msg, Mod, State, Data, Next)
     end;
-handle_msg(Msg, Parent, Name, State, Data, Mod) ->
+handle_msg(Msg, Parent, Name, State, Data, Mod, Next) ->
     Reply = try_dispatch(Msg, Mod, State, Data),
-    handle_common_reply(Reply, Parent, Name, Msg, Mod, State, Data).
+    handle_common_reply(Reply, Parent, Name, Msg, Mod, State, Data, Next).
 
-handle_msg({'$gen_call', From, Msg}, Parent, Name, State, Data, Mod, Debug) ->
+handle_msg({'$gen_call', From, Msg}, Parent, Name, State, Data, Mod, Debug, Next) ->
     Result = try_handle_call(Mod, Msg, From, State, Data),
     case Result of
         {ok, {reply, Reply, NState, NData}} ->
             Debug1 = reply(Name, From, Reply, NState, NData, Debug),
-            loop(Parent, Name, NState, NData, Mod, infinity, Debug1);
+            loop(Parent, Name, NState, NData, Mod, infinity, Debug1, Next);
         {ok, {reply, Reply, NState, NData, Time1}} ->
             Debug1 = reply(Name, From, Reply, NState, NData, Debug),
-            loop(Parent, Name, NState, NData, Mod, Time1, Debug1);
+            loop(Parent, Name, NState, NData, Mod, Time1, Debug1, Next);
+        {ok, {reply, Reply, NState, NData, Time1, {next, NextList}}} ->
+            Debug1 = reply(Name, From, Reply, NState, NData, Debug),
+            loop(Parent, Name, NState, NData, Mod, Time1, Debug1, Next ++ translate(NextList));
         {ok, {noreply, NState, NData}} ->
             Debug1 = sys:handle_debug(Debug, fun print_event/3, Name,
                                       {noreply, NState, NData}),
-            loop(Parent, Name, NState, NData, Mod, infinity, Debug1);
-        {ok, {noreply, NState, NData, Time1}} ->
+            loop(Parent, Name, NState, NData, Mod, infinity, Debug1, Next);
+        {ok, {noreply, NState, NData, Time1, {next, NextList}}} ->
             Debug1 = sys:handle_debug(Debug, fun print_event/3, Name,
                                       {noreply, NState, NData}),
-            loop(Parent, Name, NState, NData, Mod, Time1, Debug1);
+            loop(Parent, Name, NState, NData, Mod, Time1, Debug1, Next ++ translate(NextList));
         {ok, {stop, Reason, Reply, NState, NData}} ->
             {'EXIT', R} = 
                 (catch terminate(Reason, Name, Msg, Mod, NState, NData, Debug)),
             _ = reply(Name, From, Reply, NState, NData, Debug),
             exit(R);
         Other ->
-            handle_common_reply(Other, Parent, Name, Msg, Mod, State, Data, Debug)
+            handle_common_reply(Other, Parent, Name, Msg, Mod, State, Data, Debug, Next)
     end;
-handle_msg(Msg, Parent, Name, State, Data, Mod, Debug) ->
+handle_msg(Msg, Parent, Name, State, Data, Mod, Debug, Next) ->
     Reply = try_dispatch(Msg, Mod, State, Data),
-    handle_common_reply(Reply, Parent, Name, Msg, Mod, State, Data, Debug).
+    handle_common_reply(Reply, Parent, Name, Msg, Mod, State, Data, Debug, Next).
 
-handle_common_reply(Reply, Parent, Name, Msg, Mod, State, Data) ->
+handle_common_reply(Reply, Parent, Name, Msg, Mod, State, Data, Next) ->
     case Reply of
         {ok, {noreply, NState, NData}} ->
-            loop(Parent, Name, NState, NData, Mod, infinity, []);
+            loop(Parent, Name, NState, NData, Mod, infinity, [], Next);
         {ok, {noreply, NState, NData, Time1}} ->
-            loop(Parent, Name, NState, NData, Mod, Time1, []);
+            loop(Parent, Name, NState, NData, Mod, Time1, [], Next);
+        {ok, {noreply, NState, NData, Time1, {next, NextList}}} ->
+            loop(Parent, Name, NState, NData, Mod, Time1, [], Next ++ translate(NextList));
         {ok, {stop, Reason, NState, NData}} ->
-            terminate(Reason, Name, Msg, Mod, NState, NData, []);
+            terminate(Reason, Name, Msg, Mod, NState, NData, [], Next);
         {'EXIT', ExitReason, ReportReason} ->
             terminate(ExitReason, ReportReason, Name, Msg, Mod, State, Data, []);
         {ok, BadReply} ->
             terminate({bad_return_value, BadReply}, Name, Msg, Mod, State, Data, [])
     end.
 
-handle_common_reply(Reply, Parent, Name, Msg, Mod, State, Data, Debug) ->
+handle_common_reply(Reply, Parent, Name, Msg, Mod, State, Data, Debug, Next) ->
     case Reply of
         {ok, {noreply, NState, NData}} ->
             Debug1 = sys:handle_debug(Debug, fun print_event/3, Name,
                                       {noreply, NState, NData}),
-            loop(Parent, Name, NState, NData, Mod, infinity, Debug1);
+            loop(Parent, Name, NState, NData, Mod, infinity, Debug1, Next);
         {ok, {noreply, NState, NData, Time1}} ->
             Debug1 = sys:handle_debug(Debug, fun print_event/3, Name,
                                       {noreply, NState, NData}),
-            loop(Parent, Name, NState, NData, Mod, Time1, Debug1);
+            loop(Parent, Name, NState, NData, Mod, Time1, Debug1, Next);
+        {ok, {noreply, NState, NData, Time1, {next, NextList}}} ->
+            Debug1 = sys:handle_debug(Debug, fun print_event/3, Name,
+                                      {noreply, NState, NData}),
+            loop(Parent, Name, NState, NData, Mod, Time1, Debug1, Next ++ translate(NextList));
         {ok, {stop, Reason, NState, NData}} ->
             terminate(Reason, Name, Msg, Mod, NState, NData, Debug);
         {'EXIT', ExitReason, ReportReason} ->
@@ -326,11 +342,16 @@ reply(Name, {To, Tag}, Reply, State, Data, Debug) ->
                      {out, Reply, To, State, Data} ).
 
 
+translate([]) -> [];
+translate([{call, Call, From} | T]) -> [{'$gen_call', From, Call} | translate(T)];
+translate([{cast, Cast} | T]) -> [{'$gen_cast', Cast} | translate(T)];
+translate([{info, Msg} | T]) -> [Msg | translate(T)].
+
 %%-----------------------------------------------------------------
 %% Callback functions for system messages handling.
 %%-----------------------------------------------------------------
-system_continue(Parent, Debug, [Name, State, Data, Mod, Time]) ->
-    loop(Parent, Name, State, Data, Mod, Time, Debug).
+system_continue(Parent, Debug, [Name, State, Data, Mod, Time, Next]) ->
+    loop(Parent, Name, State, Data, Mod, Time, Debug, Next).
 
 -spec system_terminate(_, _, _, [_]) -> no_return().
 
