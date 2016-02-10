@@ -25,24 +25,34 @@ force_lock() ->
 init([]) ->
     {ok, unlocked, #data{}}.
 
+%% cannot re-acquire a lock
 handle_call({lock, _}, _, {locked, _} = State, Data) ->
     {reply, false, State, Data};
+%% can lock when unlocked 
 handle_call({lock, Pid}, _, unlocked, Data) ->
     Ref = erlang:monitor(process, Pid),
     {reply, true, {locked, Pid}, Data#data{ref=Ref}};
+%% force_lock simulates an 'unlock' then a 'lock' event. Can be called by anyone
+%% but demos using either of the two accepted formats to directly prioritize next actions:
+%% - `{noreply, Msg, State, Data, TimeoutOrHibernate, {next, List}}'
+%% - `{reply, reply, Msg, State, Data, TimeoutOrHibernate, {next, List}}'
 handle_call({force_lock, Pid}, From, State={_, Current}, Data) ->
     {noreply, State, Data, infinity,
      {next, [{cast, {unlock, Current}},
              {call, {lock, Pid}, From}]}};
+%% Relays current state
 handle_call(peek, _From, State, Data) ->
     {reply, State, State, Data}.
 
+%% unlocking is async, only the owner can unlock
 handle_cast({unlock, Pid}, {locked, Pid}, Data=#data{ref=Ref}) ->
     erlang:demonitor(Ref, [flush]),
     {noreply, unlocked, Data#data{ref=undefined}};
+%% All other unlocks are ignored
 handle_cast({unlock, _}, State, Data) ->
     {noreply, State, Data}.
 
+%% Auto-unlock.
 handle_info({'DOWN', Ref, process, Pid, _}, {locked, Pid}, Data=#data{ref=Ref}) ->
     {noreply, unlocked, Data#data{ref=undefined}};
 handle_info(_Ignore, State, Data) ->
